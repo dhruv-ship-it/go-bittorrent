@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 )
@@ -196,10 +197,40 @@ func (t *Torrent) Download(outfile *os.File) error {
 	
 	log.Printf("Connected to %d peers successfully", len(clients))
 	
-	// Init queues for workers to retrieve work and send results
+	// Step 2: Compute piece availability using live clients
+	availability := make([]int, len(t.PieceHashes))
+	for _, c := range clients {
+		for pieceIndex := 0; pieceIndex < len(t.PieceHashes); pieceIndex++ {
+			if c.Bittfield.HasPiece(pieceIndex) {
+				availability[pieceIndex]++
+			}
+		}
+	}
+	
+	// Log availability for debugging
+	log.Printf("Piece availability computed:")
+	for i, count := range availability {
+		if count > 0 {
+			log.Printf("Piece #%d: %d peers", i, count)
+		}
+	}
+	
+	// Step 3: Create sorted piece indexes (rarest first)
+	indexes := make([]int, len(t.PieceHashes))
+	for i := range indexes {
+		indexes[i] = i
+	}
+	
+	// Sort by availability (ascending = rarest first)
+	sort.Slice(indexes, func(i, j int) bool {
+		return availability[indexes[i]] < availability[indexes[j]]
+	})
+	
+	// Step 4: Push work in rarest-first order
 	workQueue := make(chan *pieceWork, len(t.PieceHashes))
 	resultQueue := make(chan *pieceResult)
-	for index, hash := range t.PieceHashes {
+	for _, index := range indexes {
+		hash := t.PieceHashes[index]
 		length := t.calculatePieceSize(index)
 		workQueue <- &pieceWork{index, hash, length}
 	}
