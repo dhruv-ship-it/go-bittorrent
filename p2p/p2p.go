@@ -126,18 +126,9 @@ func checkIntegrity(pw *pieceWork, buf []byte) error {
 	return nil
 }
 
-func (t *Torrent) startDownloadWorker(peer peers.Peer, workQueue chan *pieceWork, result chan *pieceResult) {
-	c, err := client.New(peer, t.PeerID, t.InfoHash)
-	if err != nil {
-		log.Printf("Clould not handshake with %s: %s", peer.String(), err)
-		return
-	}
+func (t *Torrent) startDownloadWorker(c *client.Client, workQueue chan *pieceWork, result chan *pieceResult) {
 	defer c.Conn.Close()
-
-	log.Printf("Completed handshake with %s", peer.String())
-	c.SendUnchoke()
-	c.SendInterested()
-
+	
 	for pw := range workQueue {
 		if !c.Bittfield.HasPiece(pw.index) {
 			workQueue <- pw // put piece back on the queue
@@ -180,6 +171,31 @@ func (t *Torrent) calculatePieceSize(index int) int {
 // Download downloads the torrent and streams pieces directly to the provided file
 func (t *Torrent) Download(outfile *os.File) error {
 	log.Println("Starting download for", t.Name)
+	
+	// Step 1: Initialize clients once (no double handshake)
+	var clients []*client.Client
+	for _, peer := range t.Peers {
+		c, err := client.New(peer, t.PeerID, t.InfoHash)
+		if err != nil {
+			log.Printf("Failed handshake with %s: %v", peer.String(), err)
+			continue
+		}
+		
+		// Send interested and unchoke to get bitfield
+		c.SendUnchoke()
+		c.SendInterested()
+		
+		log.Printf("Completed handshake with %s", peer.String())
+		clients = append(clients, c)
+	}
+	
+	// Check if we have any successful connections
+	if len(clients) == 0 {
+		return fmt.Errorf("no successful peer connections")
+	}
+	
+	log.Printf("Connected to %d peers successfully", len(clients))
+	
 	// Init queues for workers to retrieve work and send results
 	workQueue := make(chan *pieceWork, len(t.PieceHashes))
 	resultQueue := make(chan *pieceResult)
@@ -188,9 +204,9 @@ func (t *Torrent) Download(outfile *os.File) error {
 		workQueue <- &pieceWork{index, hash, length}
 	}
 
-	// Start workers
-	for _, peer := range t.Peers {
-		go t.startDownloadWorker(peer, workQueue, resultQueue)
+	// Start workers using pre-initialized clients
+	for _, c := range clients {
+		go t.startDownloadWorker(c, workQueue, resultQueue)
 	}
 
 	// Preallocate file to full torrent size
