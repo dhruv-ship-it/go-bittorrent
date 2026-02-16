@@ -33,7 +33,7 @@ type bencodeTorrent struct {
 	Info     bencodeInfo `bencode:"info"`
 }
 
-// DownloadToFile downloads a torrent file and writes it to a file
+// DownloadToFile downloads a torrent file and streams pieces directly to disk
 func (t *TorrentFile) DownloadToFile(path string) error {
 	var peerID [20]byte
 	_, err := rand.Read(peerID[:])
@@ -46,6 +46,13 @@ func (t *TorrentFile) DownloadToFile(path string) error {
 		return err
 	}
 
+	// Create output file immediately
+	outfile, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer outfile.Close()
+
 	torrent := p2p.Torrent{
 		Peers:       peers,
 		PeerID:      peerID,
@@ -56,20 +63,12 @@ func (t *TorrentFile) DownloadToFile(path string) error {
 		Name:        t.Name,
 	}
 
-	buf, err := torrent.Download()
+	// Stream download directly to file
+	err = torrent.Download(outfile)
 	if err != nil {
-		return err
+		return fmt.Errorf("download failed: %w", err)
 	}
 
-	outfile, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer outfile.Close()
-	_, err = outfile.Write(buf)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 

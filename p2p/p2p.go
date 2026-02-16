@@ -8,7 +8,9 @@ import (
 	"github.com/dhruv-ship-it/go-bittorrent/message"
 	"github.com/dhruv-ship-it/go-bittorrent/peers"
 	"log"
+	"os"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -175,8 +177,8 @@ func (t *Torrent) calculatePieceSize(index int) int {
 	return end - begin
 }
 
-// Download downloads the torrent . this stores the entire file in memory
-func (t *Torrent) Download() ([]byte, error) {
+// Download downloads the torrent and streams pieces directly to the provided file
+func (t *Torrent) Download(outfile *os.File) error {
 	log.Println("Starting download for", t.Name)
 	// Init queues for workers to retrieve work and send results
 	workQueue := make(chan *pieceWork, len(t.PieceHashes))
@@ -191,21 +193,55 @@ func (t *Torrent) Download() ([]byte, error) {
 		go t.startDownloadWorker(peer, workQueue, resultQueue)
 	}
 
-	// Collect results into a buffer until full
-	buf := make([]byte, t.Length)
+	// Preallocate file to full torrent size
+	err := outfile.Truncate(int64(t.Length))
+	if err != nil {
+		return fmt.Errorf("failed to preallocate file: %w", err)
+	}
+
+	// Track completion using a map for thread safety
+	completed := make(map[int]bool)
+	completedMutex := sync.RWMutex{}
 	donePieces := 0
+
 	for donePieces < len(t.PieceHashes) {
 		res := <-resultQueue
-		begin, end := t.calculateBoundsForPiece(res.index)
-		copy(buf[begin:end], res.buf)
+		
+		// Verify piece before writing (integrity check preserved)
+		err = checkIntegrity(&pieceWork{index: res.index, hash: t.PieceHashes[res.index], length: len(res.buf)}, res.buf)
+		if err != nil {
+			log.Printf("Piece #%d failed integrity check: %s", res.index, err)
+			workQueue <- &pieceWork{res.index, t.PieceHashes[res.index], t.calculatePieceSize(res.index)} // retry piece
+			continue
+		}
+
+		// Thread-safe check if piece already written
+		completedMutex.RLock()
+		if completed[res.index] {
+			completedMutex.RUnlock()
+			continue // already written by another worker
+		}
+		completedMutex.RUnlock()
+
+		// Write piece directly to file at correct offset
+		offset := int64(res.index) * int64(t.PieceLength)
+		_, err = outfile.WriteAt(res.buf, offset)
+		if err != nil {
+			return fmt.Errorf("failed to write piece #%d at offset %d: %w", res.index, offset, err)
+		}
+
+		// Mark piece as completed
+		completedMutex.Lock()
+		completed[res.index] = true
+		completedMutex.Unlock()
+		
 		donePieces++
 
 		percent := float64(donePieces) / float64(len(t.PieceHashes)) * 100
 		numWorkers := runtime.NumGoroutine() - 1 // subtract main thread
 
 		log.Printf("(%0.2f%%) Downloaded piece #%d from %d peers", percent, res.index, numWorkers)
-
 	}
 	close(workQueue)
-	return buf, nil
+	return nil
 }
