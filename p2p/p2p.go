@@ -4,16 +4,156 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"fmt"
+	"github.com/dhruv-ship-it/go-bittorrent/bitfield"
 	"github.com/dhruv-ship-it/go-bittorrent/client"
 	"github.com/dhruv-ship-it/go-bittorrent/message"
 	"github.com/dhruv-ship-it/go-bittorrent/peers"
 	"log"
 	"os"
 	"runtime"
-	"sort"
 	"sync"
 	"time"
 )
+
+// scheduler manages dynamic piece assignment with rarest-first selection
+// 
+// Lifecycle:
+// 1. Peer connects → addPeer() tracks all pieces + sets initial availability
+// 2. Peer sends HAVE → addPieceToPeer() updates inventory + increments availability (if new)
+// 3. Peer disconnects → removePeer() decrements availability for all tracked pieces
+// 4. Workers request pieces → getNextPiece() selects rarest available piece
+// 5. Piece completes → markCompleted() updates completion state
+//
+// This ensures perfect accounting between global availability[] and per-peer peerPieces[]
+type scheduler struct {
+	availability   []int
+	inProgress     map[int]bool
+	completed      map[int]bool
+	peerPieces     map[string]map[int]bool // peer.String() → piece index → hasPiece
+	mu             sync.Mutex
+}
+
+// decrementAvailability reduces piece availability when peer disconnects
+// NOTE: This function is no longer needed - availability decrements are handled
+// by removePeer() which maintains perfect accounting with peerPieces map
+
+// addPieceToPeer adds a piece to a peer's inventory and increments availability if new
+func (s *scheduler) addPieceToPeer(peerStr string, index int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pieces, exists := s.peerPieces[peerStr]
+	if !exists {
+		return
+	}
+
+	// Only increment if peer did not previously have this piece
+	if !pieces[index] {
+		pieces[index] = true
+		s.availability[index]++
+	}
+}
+
+// addPeer tracks a new peer and their available pieces
+func (s *scheduler) addPeer(peerStr string, bitfield bitfield.Bitfield) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	s.peerPieces[peerStr] = make(map[int]bool)
+	for pieceIndex := 0; pieceIndex < len(s.availability); pieceIndex++ {
+		if bitfield.HasPiece(pieceIndex) {
+			s.peerPieces[peerStr][pieceIndex] = true
+		}
+	}
+}
+
+// removePeer decrements availability for all pieces a peer had
+func (s *scheduler) removePeer(peerStr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	if pieces, exists := s.peerPieces[peerStr]; exists {
+		for pieceIndex := range pieces {
+			if s.availability[pieceIndex] > 0 {
+				s.availability[pieceIndex]--
+			}
+		}
+		delete(s.peerPieces, peerStr)
+	}
+}
+
+// getNextPiece selects the rarest available piece dynamically
+// 
+// Linear scan is used instead of a priority queue because:
+// 1. Simplicity: Easier to reason about and debug
+// 2. Low overhead: For typical torrent sizes (thousands of pieces), scan cost is negligible
+// 3. Thread safety: Single lock acquisition ensures consistent state
+// 4. Dynamic updates: Availability changes frequently, making complex data structures less beneficial
+// 5. Educational value: Demonstrates clear algorithmic thinking without optimization complexity
+func (s *scheduler) getNextPiece() *pieceWork {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	// Find piece with minimum availability
+	bestPiece := -1
+	bestAvailability := int(^uint(0) >> 1) // max int
+	
+	for index := 0; index < len(s.availability); index++ {
+		if s.inProgress[index] || s.completed[index] || s.availability[index] == 0 {
+			continue
+		}
+		
+		if s.availability[index] < bestAvailability {
+			bestAvailability = s.availability[index]
+			bestPiece = index
+		}
+	}
+	
+	if bestPiece == -1 {
+		return nil // No pieces available
+	}
+	
+	// Mark as in progress
+	s.inProgress[bestPiece] = true
+	
+	return &pieceWork{
+		index:  bestPiece,
+		hash:   [20]byte{}, // Will be filled by caller
+		length: 0,          // Will be filled by caller
+	}
+}
+
+// completedCount returns the number of completed pieces (thread-safe)
+func (s *scheduler) completedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.completed)
+}
+
+// markCompleted marks a piece as successfully downloaded
+func (s *scheduler) markCompleted(index int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	s.completed[index] = true
+	s.inProgress[index] = false
+}
+
+// markFailed marks a piece as failed (available for retry)
+func (s *scheduler) markFailed(index int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	s.inProgress[index] = false
+}
+
+// incrementAvailability updates piece availability when HAVE message received
+func (s *scheduler) incrementAvailability(index int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	s.availability[index]++
+}
 
 // MaxBlockSize is the maximum size of a block
 const MaxBlockSize = 16384
@@ -50,6 +190,8 @@ type pieceProgress struct {
 	downloaded int
 	requested  int
 	backlog    int
+	sched      *scheduler
+	peerStr    string
 }
 
 func (state *pieceProgress) readMessage() error {
@@ -71,6 +213,9 @@ func (state *pieceProgress) readMessage() error {
 			return err
 		}
 		state.client.Bittfield.SetPiece(index)
+		if state.sched != nil {
+			state.sched.addPieceToPeer(state.peerStr, index)
+		}
 	case message.MsgPiece:
 		n, err := message.ParsePiece(state.index, state.buf, msg)
 		if err != nil {
@@ -82,11 +227,13 @@ func (state *pieceProgress) readMessage() error {
 	return nil
 }
 
-func attemptDownloadPiece(c *client.Client, pw *pieceWork) ([]byte, error) {
+func attemptDownloadPiece(c *client.Client, pw *pieceWork, sched *scheduler, peerStr string) ([]byte, error) {
 	state := pieceProgress{
 		index:  pw.index,
 		client: c,
 		buf:    make([]byte, pw.length),
+		sched:  sched,
+		peerStr: peerStr,
 	}
 	// Setting a deadline helps get unresponsive peers unstuck.
 	// 30 seconds is more than enough time to download a 262 KB piece.
@@ -127,31 +274,52 @@ func checkIntegrity(pw *pieceWork, buf []byte) error {
 	return nil
 }
 
-func (t *Torrent) startDownloadWorker(c *client.Client, workQueue chan *pieceWork, result chan *pieceResult) {
-	defer c.Conn.Close()
+func (t *Torrent) startDownloadWorker(c *client.Client, sched *scheduler, result chan *pieceResult) {
+	// Track peer for cleanup on exit
+	peerStr := c.Conn.RemoteAddr().String()
+	defer func() {
+		// Remove peer from availability tracking when connection closes
+		sched.removePeer(peerStr)
+		c.Conn.Close()
+	}()
 	
-	for pw := range workQueue {
-		if !c.Bittfield.HasPiece(pw.index) {
-			workQueue <- pw // put piece back on the queue
+	for {
+		pw := sched.getNextPiece()
+		if pw == nil {
+			if sched.completedCount() == len(t.PieceHashes) {
+				return // All pieces completed
+			}
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
+		
+		// Fill in piece details
+		pw.hash = t.PieceHashes[pw.index]
+		pw.length = t.calculatePieceSize(pw.index)
+		
+		if !c.Bittfield.HasPiece(pw.index) {
+			sched.markFailed(pw.index)
+			continue
+		}
+		
 		// download piece
-		buf, err := attemptDownloadPiece(c, pw)
+		buf, err := attemptDownloadPiece(c, pw, sched, peerStr)
 		if err != nil {
 			log.Printf("exiting: %s", err)
-			workQueue <- pw // put piece back on the queue
-			return
+			sched.markFailed(pw.index)
+			continue
 		}
 
 		err = checkIntegrity(pw, buf)
 		if err != nil {
 			log.Printf("Piece #%d failed integrity check: %s", pw.index, err)
-			workQueue <- pw // put piece back on the queue
+			sched.markFailed(pw.index)
 			continue
 		}
 
 		c.SendHave(pw.index)
 		result <- &pieceResult{pw.index, buf}
+		sched.markCompleted(pw.index)
 	}
 }
 
@@ -197,47 +365,42 @@ func (t *Torrent) Download(outfile *os.File) error {
 	
 	log.Printf("Connected to %d peers successfully", len(clients))
 	
-	// Step 2: Compute piece availability using live clients
-	availability := make([]int, len(t.PieceHashes))
+	// Step 2: Initialize dynamic scheduler
+	sched := &scheduler{
+		availability:   make([]int, len(t.PieceHashes)),
+		inProgress:     make(map[int]bool),
+		completed:      make(map[int]bool),
+		peerPieces:     make(map[string]map[int]bool),
+	}
+	
+	// Compute initial availability from connected clients and track peer pieces
 	for _, c := range clients {
+		// Add peer to scheduler tracking
+		sched.addPeer(c.Conn.RemoteAddr().String(), c.Bittfield)
+		
+		// Compute availability
 		for pieceIndex := 0; pieceIndex < len(t.PieceHashes); pieceIndex++ {
 			if c.Bittfield.HasPiece(pieceIndex) {
-				availability[pieceIndex]++
+				sched.availability[pieceIndex]++
 			}
 		}
 	}
 	
+	// Initialize all pieces as available (no pending map needed)
+	// getNextPiece will handle piece selection logic
+	
 	// Log availability for debugging
 	log.Printf("Piece availability computed:")
-	for i, count := range availability {
+	for i, count := range sched.availability {
 		if count > 0 {
 			log.Printf("Piece #%d: %d peers", i, count)
 		}
 	}
 	
-	// Step 3: Create sorted piece indexes (rarest first)
-	indexes := make([]int, len(t.PieceHashes))
-	for i := range indexes {
-		indexes[i] = i
-	}
-	
-	// Sort by availability (ascending = rarest first)
-	sort.Slice(indexes, func(i, j int) bool {
-		return availability[indexes[i]] < availability[indexes[j]]
-	})
-	
-	// Step 4: Push work in rarest-first order
-	workQueue := make(chan *pieceWork, len(t.PieceHashes))
+	// Step 3: Start workers with dynamic scheduler
 	resultQueue := make(chan *pieceResult)
-	for _, index := range indexes {
-		hash := t.PieceHashes[index]
-		length := t.calculatePieceSize(index)
-		workQueue <- &pieceWork{index, hash, length}
-	}
-
-	// Start workers using pre-initialized clients
 	for _, c := range clients {
-		go t.startDownloadWorker(c, workQueue, resultQueue)
+		go t.startDownloadWorker(c, sched, resultQueue)
 	}
 
 	// Preallocate file to full torrent size
@@ -251,14 +414,14 @@ func (t *Torrent) Download(outfile *os.File) error {
 	completedMutex := sync.RWMutex{}
 	donePieces := 0
 
-	for donePieces < len(t.PieceHashes) {
+	// Step 4: Process results until all pieces completed
+	for sched.completedCount() < len(t.PieceHashes) {
 		res := <-resultQueue
 		
 		// Verify piece before writing (integrity check preserved)
 		err = checkIntegrity(&pieceWork{index: res.index, hash: t.PieceHashes[res.index], length: len(res.buf)}, res.buf)
 		if err != nil {
 			log.Printf("Piece #%d failed integrity check: %s", res.index, err)
-			workQueue <- &pieceWork{res.index, t.PieceHashes[res.index], t.calculatePieceSize(res.index)} // retry piece
 			continue
 		}
 
@@ -289,6 +452,6 @@ func (t *Torrent) Download(outfile *os.File) error {
 
 		log.Printf("(%0.2f%%) Downloaded piece #%d from %d peers", percent, res.index, numWorkers)
 	}
-	close(workQueue)
+	
 	return nil
 }
