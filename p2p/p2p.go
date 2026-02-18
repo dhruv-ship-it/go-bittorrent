@@ -388,6 +388,10 @@ func (t *Torrent) calculatePieceSize(index int) int {
 func (t *Torrent) Download(outfile *os.File) error {
 	log.Println("Starting download for", t.Name)
 	
+	// Performance instrumentation
+	var peakHeap uint64
+	maxActiveWorkers := 0
+	
 	// Step 1: Initialize clients once (no double handshake)
 	var clients []*client.Client
 	for _, peer := range t.Peers {
@@ -444,6 +448,10 @@ func (t *Torrent) Download(outfile *os.File) error {
 	for _, c := range clients {
 		go t.startDownloadWorker(c, sched, resultQueue, workerDone)
 	}
+	
+	// Track maximum concurrent workers
+	activeWorkers := len(clients)
+	maxActiveWorkers = activeWorkers
 
 	// Preallocate file to full torrent size
 	err := outfile.Truncate(int64(t.Length))
@@ -454,7 +462,7 @@ func (t *Torrent) Download(outfile *os.File) error {
 	donePieces := 0
 
 	// Step 4: Process results until all pieces completed
-	activeWorkers := len(clients)
+	activeWorkers = len(clients)
 	for sched.completedCount() < len(t.PieceHashes) {
 		select {
 		case res := <-resultQueue:
@@ -480,6 +488,13 @@ func (t *Torrent) Download(outfile *os.File) error {
 			// Return buffer to pool for reuse
 			pieceBufferPool.Put(res.buf[:0])
 			
+			// Track peak heap usage
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			if m.HeapAlloc > peakHeap {
+				peakHeap = m.HeapAlloc
+			}
+			
 			// Mark piece as completed
 			sched.markCompleted(res.index)
 			
@@ -497,6 +512,16 @@ func (t *Torrent) Download(outfile *os.File) error {
 			}
 		}
 	}
+	
+	// Print benchmark results
+	heapMB := float64(peakHeap) / 1024.0 / 1024.0
+	torrentMB := float64(t.Length) / 1024.0 / 1024.0
+	
+	fmt.Println("================ BENCHMARK RESULTS ================")
+	fmt.Printf("Torrent Size (Z): %.2f MB\n", torrentMB)
+	fmt.Printf("Peak Heap Usage (X): %.2f MB\n", heapMB)
+	fmt.Printf("Max Concurrent Peers (Y): %d\n", maxActiveWorkers)
+	fmt.Println("=============================================")
 	
 	return nil
 }
